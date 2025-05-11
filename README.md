@@ -15,7 +15,7 @@
 
 ## 시스템 아키텍처
 
-![GraphRAG 아키텍처](./docs/architecture.png)
+![GraphRAG 아키텍처](./docs/architecture_diagram.svg)
 
 ### 주요 컴포넌트
 
