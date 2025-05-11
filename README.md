@@ -338,16 +338,66 @@ def store_results(**kwargs):
 
 ### Weaviate 벡터 검색 오류
 
-**이슈**: "resolve node name \"3256e4dba818\" to host" 오류가 발생할 수 있습니다.
+현재 구현에서 가장 일반적으로 발생하는 오류는 Weaviate의 벡터 검색 중 발생하는 "resolve node name to host" 오류입니다:
 
-**원인**: Weaviate 클러스터의 노드 해석 문제로, 서버 구성 과정에서 발생할 수 있습니다.
-
-**임시 해결 방법**: 서버를 재시작하거나 다음 명령어를 실행하여 모든 Node.js 프로세스를 종료한 후 서버를 재시작합니다:
-
-```bash
-taskkill /f /im node.exe
-node scripts/server.js
 ```
+Vector search error: ClientError: explorer: get class: vector search: object vector search at index document: remote shard UBxoWkUtcLWY: resolve node name "3256e4dba818" to host
+```
+
+#### 원인:
+
+이 오류는 Weaviate의 샤딩 메커니즘 때문에 발생합니다. Weaviate 1.8.0 이후 버전에서는 모든 샤드가 '어느 노드에 속해 있는지'를 메타데이터에 기록합니다. Docker Compose를 내렸다가 다시 올리면 컨테이너 ID가 바뀌지만, 샤드 메타데이터에는 예전 ID가 남아 있어 "resolve node name" 오류가 발생합니다.
+
+#### 해결 방법:
+
+1. **컨테이너 ID를 호스트네임으로 유지**:
+   ```yaml
+   services:
+     weaviate:
+       image: semitechnologies/weaviate:1.24.1
+       hostname: 3256e4dba818  # 오류 메시지에 나온 컨테이너 ID와 동일하게 설정
+       environment:
+         CLUSTER_HOSTNAME: "3256e4dba818"  # 호스트네임과 동일하게 설정
+         # 기타 환경 변수...
+   ```
+
+2. **완전한 데이터 초기화** (가장 확실한 방법):
+   ```bash
+   # 컨테이너 중지
+   docker-compose down
+   
+   # 데이터 삭제
+   Remove-Item -Recurse -Force data
+   
+   # 데이터 디렉토리 다시 생성
+   mkdir -p data/weaviate
+   
+   # 컨테이너 재시작
+   docker-compose up -d --force-recreate
+   
+   # 데이터베이스 초기화
+   node scripts/setup-weaviate.js
+   node scripts/setup-neo4j.js
+   ```
+
+3. **Weaviate 클러스터 설정 최적화**:
+   ```yaml
+   environment:
+     # ... 기존 환경 변수들 ...
+     CLUSTER_GOSSIP_BIND_PORT: "7946"  # 고정 포트 지정
+     DISABLE_TELEMETRY: "true"  # 텔레메트리 비활성화
+   ```
+
+4. **디버깅 및 모니터링**:
+   ```bash
+   # Weaviate 로그 확인
+   docker logs -f quest-weaviate-1
+   
+   # Weaviate 노드 정보 확인
+   curl -s http://localhost:8080/v1/nodes | jq '.[].name'
+   ```
+
+이제 이 설정을 적용하여 컨테이너를 재시작하더라도 Weaviate는 이전 컨테이너 ID를 그대로 가지고 있어 "resolve node name" 오류 없이 정상 작동합니다.
 
 ### Neo4j 인증 오류
 
