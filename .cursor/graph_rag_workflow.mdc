@@ -1,0 +1,153 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+---
+# GraphRAG Q&A Automation – MCP Rules
+# Version 0.1  (2025‑05‑12)
+# Purpose: Automate the end‑to‑end workflow for the "노트북 쇼핑몰 GraphRAG Q&A 자동화 시스템".
+# This file lives in .cursor/rules or .roo/rules and will be loaded by Task‑Master.
+# All rules use the ⟶ syntax for explicit control‑flow; any unknown handler is assumed
+# to be implemented in the project's scripts/ directory or exposed as a task‑master plugin.
+# -----------------------------------------------------------------------------
+settings:
+  default_model: openai/gpt-4o
+  default_temperature: 0.2
+  max_tokens: 4096
+  # env: values are read from .env or OS‑level vars
+  env:
+    WEAVIATE_URL: ${WEAVIATE_URL}
+    NEO4J_URI: ${NEO4J_URI}
+    OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+# ============================================================================
+# ── 1. DATA INGEST DAG (daily @ 02:00 KST) ───────────────────────────────────
+# -----------------------------------------------------------------------------
+rule extract_data:
+  description: |
+    Pull raw customer‑service logs, search queries and product docs from S3 & DB.
+  schedule: cron("0 17 * * *")   # 02:00 KST == 17:00 UTC previous day
+  outputs:
+    - path: data/raw/{{ ds }}/
+  exec: python scripts/extract_data.py --date {{ ds }}
+  next: clean_text
+
+rule clean_text:
+  description: Clean / normalise raw text (HTML strip, typo fix, etc.)
+  inputs:
+    - data/raw/{{ ds }}/
+  outputs:
+    - data/clean/{{ ds }}/
+  exec: python scripts/clean_text.py --date {{ ds }}
+  retries: 2
+  next: classify_intent
+
+rule classify_intent:
+  description: LLM‑based intent classifier; writes intent labels to parquet
+  inputs:
+    - data/clean/{{ ds }}/
+  outputs:
+    - data/intent/{{ ds }}/
+  exec: python scripts/classify_intent.py --date {{ ds }}
+  next: cluster_questions
+
+rule cluster_questions:
+  description: Embedding + KMeans to group similar questions
+  inputs:
+    - data/intent/{{ ds }}/
+  outputs:
+    - data/clusters/{{ ds }}/
+  exec: python scripts/cluster_questions.py --date {{ ds }}
+  next: generate_draft_answer
+
+rule generate_draft_answer:
+  description: Create draft answers with GPT‑4o using KB context
+  inputs:
+    - data/clusters/{{ ds }}/
+  outputs:
+    - data/draft_answers/{{ ds }}/
+  exec: python scripts/generate_answer.py --date {{ ds }}
+  next:
+    - update_vector_db
+    - update_kg
+
+rule update_vector_db:
+  description: Upsert embeddings (questions+answers) into Weaviate
+  inputs:
+    - data/draft_answers/{{ ds }}/
+  exec: python scripts/update_weaviate.py --date {{ ds }}
+  next: submit_for_review
+
+rule update_kg:
+  description: Extract entities & relations → upsert into Neo4j
+  inputs:
+    - data/draft_answers/{{ ds }}/
+  exec: python scripts/update_neo4j.py --date {{ ds }}
+
+rule submit_for_review:
+  description: Push new/updated intents to Streamlit dashboard for human review
+  inputs:
+    - data/draft_answers/{{ ds }}/
+  exec: python scripts/push_to_review_queue.py --date {{ ds }}
+  notify: slack("@cs_manager", "신규 의도/답변 검토 필요 – {{ ds }} batch 완료")
+
+# ============================================================================
+# ── 2. APPROVAL & PUBLISH (event‑driven) ─────────────────────────────────────
+# -----------------------------------------------------------------------------
+rule approve_answer:
+  description: Triggered from dashboard when 운영자 clicks "승인".  Moves answer → production.
+  inputs:
+    - intent_id
+  exec: python scripts/promote_answer.py --intent {{ intent_id }}
+  next: retrain_rag_cache
+
+rule retrain_rag_cache:
+  description: Re‑embed approved answer and refresh retrieval cache.
+  inputs:
+    - intent_id
+  exec: python scripts/refresh_cache.py --intent {{ intent_id }}
+
+# ============================================================================
+# ── 3. CHATBOT RUNTIME ───────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+rule chatbot_query:
+  description: Entry point for POST /api/chatbot/query
+  inputs:
+    - user_question
+  steps:
+    - name: retrieve_candidates
+      handler: weaviate.search(user_question, top_k=5)
+    - name: graph_reasoning
+      handler: neo4j.multi_hop(user_question)
+    - name: compose_prompt
+      handler: jinja("prompts/graph_rag.j2", context)
+    - name: generate
+      handler: openai.chat(prompt)
+  outputs:
+    - answer
+    - source_refs
+  on_error: fallback_answer
+
+rule fallback_answer:
+  description: Low‑confidence fallback – apologise & escalate
+  handler: default_fallback(user_question)
+
+# ============================================================================
+# ── 4. MONITORING & ALERTS ───────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+rule monitor_airflow:
+  description: Check DAG success rate; alert if failures > 0
+  schedule: cron("*/30 * * * *")
+  exec: python scripts/check_airflow.py
+  notify: slack("#alerts", "Airflow DAG 실패 감지! 자세히 확인 바랍니다.")
+
+rule latency_watch:
+  description: Push gateway ping to measure avg LLM latency
+  schedule: cron("*/5 * * * *")
+  exec: python scripts/latency_probe.py
+
+# ============================================================================
+# EOF
+
+
